@@ -1,0 +1,199 @@
+# ============================================================
+# Alpha Diversity Dashboard for Bracken Reports
+# Versão completa com nomes corrigidos (T-I e T-II)
+# ============================================================
+
+import os
+import glob
+import math
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.optimize import root_scalar
+
+# ------------------------------------------------------------
+# 1. CONFIGURAÇÃO
+# ------------------------------------------------------------
+INPUT_FOLDER = "/home/viroicbas2023/Documents/Ricardo/Grutas16S/GrackenCaverna16S/Output/bracken"
+OUTPUT_HTML  = "/home/viroicbas2023/Documents/Ricardo/Grutas16S/Rarefaction_curves_results/alpha_diversity.html"
+OUTPUT_CSV   = "/home/viroicbas2023/Documents/Ricardo/Grutas16S/Rarefaction_curves_results/alpha_diversity_metrics.csv"
+
+PLOT_TITLE   = "Alpha Diversity Dashboard"
+SHOW_PLOT    = True
+
+# Amostras 1 e 2 corrigidas para T-I e T-II
+SAMPLE_CONFIG = {
+    "1": {"name": "T-I",   "color": "#1f77b4"},
+    "2": {"name": "T-II",  "color": "#ff7f0e"},
+    "3": {"name": "M-II",  "color": "#2ca02c"},
+    "4": {"name": "A-I",   "color": "#d62728"},
+    "5": {"name": "MV-I",  "color": "#9467bd"},
+    "6": {"name": "M-I",   "color": "#8c564b"},
+    "7": {"name": "MN-I",  "color": "#e377c2"},
+}
+
+METRIC_LABELS = {
+    "Observed Richness": "Observed Taxa (S)",
+    "Shannon Index": "Shannon Index (H')",
+    "Simpson Index (1-D)": "Gini-Simpson (1 - D)",
+    "Pielou Evenness": "Pielou's Evenness (J')",
+    "Fisher's Alpha": "Fisher's Log-Series α"
+}
+
+
+# ------------------------------------------------------------
+# 2. CÁLCULO DAS MÉTRICAS DE DIVERSIDADE
+# ------------------------------------------------------------
+def calculate_metrics(counts):
+    counts = np.asarray(counts, dtype=np.float64)
+    counts = counts[counts > 0]
+    
+    S = len(counts)
+    N = counts.sum()
+
+    if N < 2 or S == 0:
+        return {m: 0.0 for m in METRIC_LABELS}
+
+    # Shannon Index (H')
+    p = counts / N
+    H = -np.sum(p * np.log(p))
+
+    # Gini-Simpson Index (1 - D)
+    D = np.sum(counts * (counts - 1.0)) / (N * (N - 1.0))
+    Gini_Simpson = max(0.0, 1.0 - D)
+
+    # Pielou's Evenness (J')
+    J = H / np.log(S) if S > 1 else 0.0
+
+    # Fisher's Log-Series Alpha
+    def fisher_eq(a):
+        return a * math.log(1.0 + N / a) - S
+
+    try:
+        sol = root_scalar(fisher_eq, bracket=[1e-10, max(N * 10, 1e6)], method='brentq')
+        f_alpha = sol.root if sol.converged else 0.0
+    except (ValueError, RuntimeError):
+        f_alpha = 0.0
+
+    return {
+        "Observed Richness": int(S),
+        "Shannon Index": round(H, 3),
+        "Simpson Index (1-D)": round(Gini_Simpson, 3),
+        "Pielou Evenness": round(J, 3),
+        "Fisher's Alpha": round(f_alpha, 3)
+    }
+
+
+# ------------------------------------------------------------
+# 3. LEITURA DOS FICHEIROS BRACKEN
+# ------------------------------------------------------------
+def load_bracken_data(input_folder):
+    files = glob.glob(os.path.join(input_folder, "*.txt"))
+    if not files:
+        raise FileNotFoundError(f"Nenhum ficheiro .txt encontrado em: {input_folder}")
+
+    rows = []
+    for filepath in files:
+        sample_id = (
+            os.path.basename(filepath)
+            .replace("_breport.txt", "")
+            .replace("_bracken.txt", "")
+            .replace(".txt", "")
+            .strip()
+        )
+        
+        try:
+            df = pd.read_csv(filepath, sep="\t")
+            col = "new_est_reads" if "new_est_reads" in df.columns else df.columns[1]
+            reads = pd.to_numeric(df[col], errors="coerce").dropna().values
+        except Exception as err:
+            print(f"Erro ao processar {filepath}: {err}")
+            continue
+
+        cfg = SAMPLE_CONFIG.get(sample_id, {})
+        metrics = calculate_metrics(reads)
+        
+        rows.append({
+            "sample_id": sample_id,
+            "Sample": cfg.get("name", sample_id),
+            "color": cfg.get("color", "#1f77b4"),
+            **metrics
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------
+# 4. GERAÇÃO DO DASHBOARD (Grid 2x3)
+# ------------------------------------------------------------
+def plot_dashboard(df, output_path):
+    metrics = list(METRIC_LABELS.keys())
+    
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[METRIC_LABELS[m] for m in metrics],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.20
+    )
+
+    grid_positions = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
+
+    for idx, metric in enumerate(metrics):
+        row, col = grid_positions[idx]
+        
+        fig.add_trace(
+            go.Bar(
+                x=df["Sample"],
+                y=df[metric],
+                marker=dict(
+                    color=df["color"],
+                    line=dict(color="rgba(0,0,0,0.15)", width=1)
+                ),
+                text=df[metric],
+                textposition="auto",
+                hovertemplate=f"<b>%{{x}}</b><br>{METRIC_LABELS[metric]}: <b>%{{y}}</b><extra></extra>",
+                showlegend=False
+            ),
+            row=row, col=col
+        )
+        
+        y_max = df[metric].max()
+        fig.update_yaxes(range=[0, y_max * 1.18 if y_max > 0 else 1], row=row, col=col)
+
+    fig.update_layout(
+        title=dict(text=f"<b>{PLOT_TITLE}</b>", font=dict(size=20, family="Arial")),
+        template="plotly_white",
+        height=720,
+        margin=dict(l=50, r=40, t=90, b=50)
+    )
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fig.write_html(output_path)
+    print(f"Dashboard HTML guardado em: {os.path.abspath(output_path)}")
+    
+    if SHOW_PLOT:
+        fig.show()
+
+
+# ------------------------------------------------------------
+# 5. EXECUÇÃO PRINCIPAL
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    if not os.path.exists(INPUT_FOLDER):
+        print(f"Erro: O caminho da pasta '{INPUT_FOLDER}' não existe.")
+        raise SystemExit(1)
+
+    print("A processar ficheiros Bracken...")
+    df_metrics = load_bracken_data(INPUT_FOLDER)
+
+    print("\n" + "=" * 70)
+    print(df_metrics[["Sample"] + list(METRIC_LABELS.keys())].to_string(index=False))
+    print("=" * 70 + "\n")
+
+    if OUTPUT_CSV:
+        os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_CSV)), exist_ok=True)
+        df_metrics.drop(columns=["color"]).to_csv(OUTPUT_CSV, index=False)
+        print(f"Tabela CSV guardada em: {os.path.abspath(OUTPUT_CSV)}")
+
+    plot_dashboard(df_metrics, OUTPUT_HTML)
