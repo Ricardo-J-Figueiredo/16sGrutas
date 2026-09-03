@@ -45,22 +45,30 @@ SHOW_SD_SHADING = True
 SHOW_PLOT = True
 
 # ------------------------------------------------------------
-# Optional sample names
+# Sample display names and colours
 #
-# If you want nicer names in the plot, specify them here.
+# Key   = sample_id (derived from the Bracken filename, i.e.
+#         the filename with "_bracken.txt" removed)
+# Value = dict with optional "name" and "color" keys
+#
+#   "name"  -> label shown in the plot legend
+#              (falls back to the original sample_id if omitted)
+#   "color" -> any Plotly/CSS colour string, e.g. "#1f77b4",
+#              "rgb(31,119,180)", "steelblue"
+#              (falls back to the default colour cycle if omitted)
 #
 # Example:
-# SAMPLE_NAMES = {
-#     "sample1": "Control",
-#     "sample2": "Treatment",
+# SAMPLE_CONFIG = {
+#     "sample1": {"name": "Control",   "color": "#1f77b4"},
+#     "sample2": {"name": "Treatment", "color": "#d62728"},
 # }
 #
-# If a sample is not listed here, its original sample ID
-# will automatically be used.
+# Any sample not listed here uses its original sample_id as the
+# name and the next colour from the default cycle.
 # ------------------------------------------------------------
-SAMPLE_NAMES = {
-    # "sample1": "Control",
-    # "sample2": "Treatment",
+SAMPLE_CONFIG = {
+    # "sample1": {"name": "Control",   "color": "#1f77b4"},
+    # "sample2": {"name": "Treatment", "color": "#d62728"},
 }
 
 
@@ -268,20 +276,26 @@ def plot_rarefaction_curves_html(
     rarefaction_results,
     output_file,
     plot_title,
-    sample_names=None,
+    sample_config=None,
     show_sd_shading=True
 ):
     """
     Plot rarefaction curves with optional logarithmic
     standard-deviation shading.
+
+    sample_config : dict, optional
+        Maps sample_id -> {"name": ..., "color": ...}.
+        Either key may be omitted; missing values fall back to
+        the original sample_id (name) or the default colour
+        cycle (color).
     """
 
-    if sample_names is None:
-        sample_names = {}
+    if sample_config is None:
+        sample_config = {}
 
     fig = go.Figure()
 
-    color_scale = [
+    default_color_cycle = [
         "#1f77b4",
         "#ff7f0e",
         "#2ca02c",
@@ -306,10 +320,9 @@ def plot_rarefaction_curves_html(
             )
             continue
 
-        sample_name = sample_names.get(
-            sample_id,
-            sample_id
-        )
+        config = sample_config.get(sample_id, {})
+
+        sample_name = config.get("name", sample_id)
 
         depths = np.array(
             list(data.keys()),
@@ -355,22 +368,32 @@ def plot_rarefaction_curves_html(
             smooth_counts = species_counts
 
         # ----------------------------------------------------
-        # Colour
+        # Colour: use the user-defined colour if provided,
+        # otherwise fall back to the next colour in the
+        # default cycle.
         # ----------------------------------------------------
 
-        color = color_scale[
-            color_idx % len(color_scale)
-        ]
+        color = config.get("color")
 
-        # Convert HEX colour to RGB
-        rgb = tuple(
-            int(color[i:i + 2], 16)
-            for i in (1, 3, 5)
-        )
+        if not color:
+            color = default_color_cycle[
+                color_idx % len(default_color_cycle)
+            ]
+            color_idx += 1
 
-        fill_color = (
-            f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.20)"
-        )
+        # Convert colour to an RGBA fill for the SD shading.
+        # Handles hex colours (#rrggbb); for named/rgb() colours
+        # that Plotly understands natively, fall back to a
+        # semi-transparent grey fill since we can't easily parse
+        # arbitrary CSS colour strings ourselves.
+        if color.startswith("#") and len(color) == 7:
+            rgb = tuple(
+                int(color[i:i + 2], 16)
+                for i in (1, 3, 5)
+            )
+            fill_color = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.20)"
+        else:
+            fill_color = "rgba(128, 128, 128, 0.20)"
 
         # ----------------------------------------------------
         # Main fitted curve
@@ -442,8 +465,6 @@ def plot_rarefaction_curves_html(
             max_otus,
             species_counts.max()
         )
-
-        color_idx += 1
 
     # --------------------------------------------------------
     # Layout
@@ -598,7 +619,7 @@ if __name__ == "__main__":
         rarefaction_results,
         OUTPUT_FILE,
         PLOT_TITLE,
-        SAMPLE_NAMES,
+        SAMPLE_CONFIG,
         show_sd_shading=SHOW_SD_SHADING
     )
 
