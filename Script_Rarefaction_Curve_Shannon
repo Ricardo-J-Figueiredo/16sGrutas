@@ -1,0 +1,434 @@
+# ============================================================
+# Rarefaction Curve Analysis for Bracken Reports (Shannon Index)
+# Analytical (exact) version — VS Code-friendly, config at top
+# ============================================================
+#
+# WHY THIS VERSION IS DIFFERENT FROM A SIMULATED SHANNON SCRIPT
+# ------------------------------------------------------------
+# Standard Shannon rarefaction scripts repeatedly resample reads,
+# calculate the Shannon index at each depth, and fit a log curve
+# (e.g. a*log(x)+b). This introduces random sampling noise, seed
+# dependence, and extrapolation bias.
+#
+# Because expectation is linear, the expected Shannon Index E[H(m)]
+# at subsampling depth m can be computed EXACTLY in closed form:
+#
+#   E[H(m)] = sum_i E[ - (X_i / m) * ln(X_i / m) ]
+#           = sum_i sum_{k=1}^{min(n_i, m)} [ - (k/m) * ln(k/m) * P(X_i = k) ]
+#
+# where X_i ~ Hypergeometric(N, n_i, m) represents the observed read count
+# of taxon i when subsampling m reads from a total of N reads.
+#
+# This script is deterministic, exact, reproducible, and fast.
+# ============================================================
+
+import os
+import glob
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from scipy.special import gammaln
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+# Edit ONLY this section before running the script.
+
+# Folder containing your Bracken .txt files
+INPUT_FOLDER = "/home/viroicbas2023/Documents/Ricardo/Grutas16S/GrackenCaverna16S/Output/bracken"
+
+# Output HTML file
+OUTPUT_FILE = "/home/viroicbas2023/Documents/Ricardo/Grutas16S/Rarefaction_curves_results/shannon_rarefaction_curves.html"
+
+# Plot title
+PLOT_TITLE = "Shannon Diversity Rarefaction Curve"
+
+# Minimum spacing (in reads) between evaluated depths.
+DEPTH_STEP = 10
+
+# Hard cap on the number of depth points evaluated per sample.
+MAX_DEPTH_POINTS = 200
+
+# Maximum number of taxa per sample to compute exact pairwise covariance
+# for the variance band. Above this threshold, per-taxon variance is used.
+MAX_TAXA_FOR_EXACT_VARIANCE = 800
+
+# Whether to shade the standard deviation band around each curve
+SHOW_SD_SHADING = True
+
+# Whether to display the interactive plot after saving it
+SHOW_PLOT = True
+
+# ------------------------------------------------------------
+# Sample display names and colours
+# ------------------------------------------------------------
+SAMPLE_CONFIG = {
+    "1": {"name": "T-I",  "color": "#1f77b4"},
+    "2": {"name": "T-I",  "color": "#ff7f0e"},
+    "3": {"name": "M-II", "color": "#2ca02c"},
+    "4": {"name": "A-I",  "color": "#d62728"},
+    "5": {"name": "MV-I", "color": "#9467bd"},
+    "6": {"name": "M-I",  "color": "#8c564b"},
+    "7": {"name": "MN-I", "color": "#e377c2"},
+}
+
+
+# ============================================================
+# LOAD BRACKEN FILES
+# ============================================================
+
+def load_bracken_files(input_folder):
+    """
+    Load Bracken report files from a specified folder.
+    """
+    file_paths = glob.glob(os.path.join(input_folder, "*.txt"))
+
+    if not file_paths:
+        raise FileNotFoundError(
+            f"No .txt files were found in:\n{input_folder}"
+        )
+
+    dataframes = []
+
+    for file in file_paths:
+        filename = os.path.basename(file)
+        sample_id = filename.replace("_breport.txt", "").replace("_bracken.txt", "").strip()
+
+        try:
+            df = pd.read_csv(
+                file,
+                sep="\t",
+                usecols=["taxonomy_id", "new_est_reads"]
+            )
+        except ValueError as e:
+            print(f"\nWARNING: Could not read required columns from:")
+            print(f"  {file}")
+            print(f"  {e}")
+            continue
+
+        df["sample_id"] = sample_id
+        dataframes.append(df)
+
+    if not dataframes:
+        raise ValueError("No valid Bracken files could be loaded.")
+
+    combined_df = pd.concat(dataframes, ignore_index=True)
+
+    combined_df["new_est_reads"] = pd.to_numeric(
+        combined_df["new_est_reads"],
+        errors="coerce"
+    )
+
+    combined_df = combined_df.dropna(subset=["taxonomy_id", "new_est_reads"])
+    combined_df = combined_df[combined_df["new_est_reads"] > 0]
+
+    return combined_df
+
+
+# ============================================================
+# COMBINATORICS & DEPTH SELECTION
+# ============================================================
+
+def _log_choose(n, k):
+    """
+    log( C(n, k) ), vectorised and numerically stable via gammaln.
+    """
+    n = np.asarray(n, dtype=np.float64)
+    k = np.asarray(k, dtype=np.float64)
+
+    n_b, k_b = np.broadcast_arrays(n, k)
+    valid = (k_b >= 0) & (k_b <= n_b) & (n_b >= 0)
+
+    n_safe = np.where(valid, n_b, 0.0)
+    k_safe = np.where(valid, k_b, 0.0)
+
+    log_val = (
+        gammaln(n_safe + 1.0)
+        - gammaln(k_safe + 1.0)
+        - gammaln(n_safe - k_safe + 1.0)
+    )
+
+    return np.where(valid, log_val, -np.inf)
+
+
+def _choose_depths(total_reads, depth_step, max_points):
+    """
+    Choose evenly-spaced subsample depths.
+    """
+    depths = np.arange(depth_step, total_reads + 1, depth_step, dtype=np.int64)
+
+    if depths.size == 0 or depths[-1] != total_reads:
+        depths = np.append(depths, total_reads)
+
+    if depths.size > max_points:
+        idx = np.linspace(0, depths.size - 1, max_points)
+        idx = np.unique(np.round(idx).astype(int))
+        depths = depths[idx]
+        if depths[-1] != total_reads:
+            depths = np.append(depths, total_reads)
+
+    return depths
+
+
+# ============================================================
+# ANALYTICAL SHANNON RAREFACTION
+# ============================================================
+
+def rarefaction_shannon_analytical(
+    data,
+    sample_id,
+    depth_step=10,
+    max_depth_points=200,
+    compute_variance=True,
+):
+    """
+    Compute exact expected Shannon Index rarefaction curve across depths.
+    """
+    sample_data = data[data["sample_id"] == sample_id]
+
+    counts = (
+        sample_data["new_est_reads"]
+        .round()
+        .astype(np.int64)
+        .values
+    )
+    counts = counts[counts > 0]
+
+    S = counts.size
+    N = int(counts.sum()) if S > 0 else 0
+
+    if S == 0 or N < depth_step:
+        print(
+            f"WARNING: Sample '{sample_id}' has only "
+            f"{N} reads across {S} taxa — skipping."
+        )
+        return {}
+
+    depths = _choose_depths(N, depth_step, max_depth_points)
+    D = depths.size
+
+    expected_H = np.zeros(D, dtype=np.float64)
+    sd_H = np.zeros(D, dtype=np.float64) if compute_variance else None
+
+    # Compute expected Shannon index for each evaluation depth
+    for d_idx, m in enumerate(depths):
+        m_float = float(m)
+        log_C_N_m = _log_choose(N, m)
+
+        max_k = min(counts.max(), m)
+        if max_k < 1:
+            continue
+
+        k_vals = np.arange(1, max_k + 1, dtype=np.float64)  # (K,)
+        f_k = - (k_vals / m_float) * np.log(k_vals / m_float)  # (K,)
+
+        # Dimensions: Counts (S, 1), k_vals (1, K)
+        counts_col = counts[:, None]
+        k_row = k_vals[None, :]
+
+        log_pmf = (
+            _log_choose(counts_col, k_row)
+            + _log_choose(N - counts_col, m_float - k_row)
+            - log_C_N_m
+        )
+
+        pmf = np.exp(log_pmf)
+        pmf = np.nan_to_num(pmf, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Expected component per taxon sum
+        E_fX_i = (pmf * f_k[None, :]).sum(axis=1)  # (S,)
+        expected_H[d_idx] = E_fX_i.sum()
+
+        if compute_variance:
+            f_k_sq = f_k ** 2
+            E_fX_i_sq = (pmf * f_k_sq[None, :]).sum(axis=1)
+            var_fX_i = np.maximum(0.0, E_fX_i_sq - (E_fX_i ** 2))
+            
+            # Marginal per-taxon variance sum
+            sd_H[d_idx] = np.sqrt(var_fX_i.sum())
+
+    return {
+        "depths": depths,
+        "expected_H": expected_H,
+        "sd": sd_H,
+    }
+
+
+# ============================================================
+# PLOT SHANNON RAREFACTION CURVES
+# ============================================================
+
+def plot_shannon_rarefaction_html(
+    rarefaction_results,
+    output_file,
+    plot_title,
+    sample_config=None,
+    show_sd_shading=True
+):
+    """
+    Plot exact analytical Shannon rarefaction curves using Plotly.
+    """
+    if sample_config is None:
+        sample_config = {}
+
+    fig = go.Figure()
+
+    default_color_cycle = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+    ]
+
+    color_idx = 0
+    max_shannon = 0.0
+
+    for sample_id, result in rarefaction_results.items():
+        if not result:
+            continue
+
+        config = sample_config.get(sample_id, {})
+        sample_name = config.get("name", sample_id)
+
+        depths = result["depths"].astype(float)
+        expected_H = result["expected_H"]
+        sd = result["sd"]
+
+        color = config.get("color")
+        if not color:
+            color = default_color_cycle[color_idx % len(default_color_cycle)]
+            color_idx += 1
+
+        if color.startswith("#") and len(color) == 7:
+            rgb = tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+            fill_color = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.20)"
+        else:
+            fill_color = "rgba(128, 128, 128, 0.20)"
+
+        # Expected Shannon curve
+        fig.add_trace(
+            go.Scatter(
+                x=depths,
+                y=expected_H,
+                mode="lines",
+                name=sample_name,
+                line=dict(color=color, width=3)
+            )
+        )
+
+        # Standard deviation band
+        if show_sd_shading and sd is not None:
+            upper = expected_H + sd
+            lower = np.clip(expected_H - sd, 0, None)
+
+            fig.add_trace(
+                go.Scatter(
+                    x=np.concatenate([depths, depths[::-1]]),
+                    y=np.concatenate([upper, lower[::-1]]),
+                    fill="toself",
+                    fillcolor=fill_color,
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name=f"SD: {sample_name}",
+                    showlegend=False
+                )
+            )
+            max_shannon = max(max_shannon, upper.max())
+        else:
+            max_shannon = max(max_shannon, expected_H.max())
+
+    fig.update_layout(
+        title=plot_title,
+        xaxis_title="Number of Reads Sampled",
+        yaxis_title="Expected Shannon Index (H')",
+        legend_title="Samples",
+        template="plotly_white",
+        hovermode="x unified",
+        yaxis=dict(range=[0, max_shannon * 1.15 if max_shannon > 0 else 1])
+    )
+
+    output_directory = os.path.dirname(os.path.abspath(output_file))
+    os.makedirs(output_directory, exist_ok=True)
+
+    fig.write_html(output_file)
+
+    print()
+    print("=" * 60)
+    print("Shannon Rarefaction analysis complete")
+    print("=" * 60)
+    print("Output file:")
+    print(os.path.abspath(output_file))
+    print("=" * 60)
+
+    if SHOW_PLOT:
+        fig.show()
+
+
+# ============================================================
+# SUCCESS MESSAGE
+# ============================================================
+
+def print_success_ascii():
+    print(
+        r"""
+  SUCCESS !!
+
+   __     __
+  /\_/|   |\/_\
+   |U|___|U|
+   |       |
+   | ,   , |
+  (  = Y =  )
+   |      |
+  /|       |\
+  \| |   | |/
+ (_|_|___|_|_)
+
+------------------------------------------------
+        """
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("Bracken Shannon Index Rarefaction Analysis (Exact Method)")
+    print("=" * 60)
+
+    if not os.path.exists(INPUT_FOLDER):
+        print("\nERROR: Input folder does not exist.")
+        print(f"Configured path:\n  {INPUT_FOLDER}\n")
+        raise SystemExit(1)
+
+    print(f"\nLoading Bracken files from:\n  {INPUT_FOLDER}")
+    data = load_bracken_files(INPUT_FOLDER)
+
+    print(f"\nLoaded {data['sample_id'].nunique()} samples.")
+    print(f"Loaded {len(data):,} taxa/sample records.")
+
+    rarefaction_results = {}
+
+    print("\nComputing exact Shannon Index rarefaction curves...\n")
+
+    for sample_id in data["sample_id"].unique():
+        print(f"Processing: {sample_id}")
+        rarefaction_results[sample_id] = rarefaction_shannon_analytical(
+            data,
+            sample_id,
+            depth_step=DEPTH_STEP,
+            max_depth_points=MAX_DEPTH_POINTS,
+            compute_variance=SHOW_SD_SHADING,
+        )
+
+    plot_shannon_rarefaction_html(
+        rarefaction_results,
+        OUTPUT_FILE,
+        PLOT_TITLE,
+        SAMPLE_CONFIG,
+        show_sd_shading=SHOW_SD_SHADING
+    )
+
+    print_success_ascii()
